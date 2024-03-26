@@ -7,25 +7,26 @@ status: Unpublished
 feedback link: https://github.com/Snowflake-Labs/sfguides/issues
 tags: Hex, Modelbit, Notebooks, Partner Connect
 
-# Building and deploying a Nurse Attrition model with Hex + +Modelbit + Snowflake
+# Building and deploying a Nurse Attrition model with Hex + Modelbit + Snowflake
 
 <!-- ------------------------ -->
 ## Lab Overview 
 Duration: 5
 
-In this demo, we will play the role of a data scientist at a large hospital tasked with identifying employees at risk of attrition and factors contributing to attrition. To do this, we would like to build a predictive model using our employee database and information about staff attrition. Let's see how we can use Hex in collaboration with Snowflake/Snowpark to do some Exploratory Data Analysis and then build an XGBoost forecasting model. Once our model is tuned, we will use modelbit to easily deploy our model to Snowflake so that we can do inference scoring. 
+In this demo, we will play the role of a data scientist at a large hospital tasked with identifying employees at risk of attrition and factors contributing to attrition. To do this, we would like to build a predictive model using our employee database and information about staff attrition. Let's see how we can use Hex in collaboration with Snowflake/Snowpark to do some Exploratory Data Analysis and then build a random forest forecasting model. Once our model is tuned, we will use Snowflake Model registry and modelbit to easily deploy our model to Snowflake so that we can do inference scoring.
 
 ### Prerequisites
 - Familiarity with basic Python and SQL 
 - Familiarity with training ML models
 - Familiarity with data science notebooks
 - Familiarity with Machine Learning pipelines and deployment
+- Modelbit trial account
 
 
 ### What You'll Learn
 * How to load data into Snowflake
 * How to import/export data between Hex and Snowflake
-* How to train an XGBoost model and deploy to Snowflake using UDTFs or Modelbit
+* How to train a Random forest model and deploy to Snowflake using Snowflake Model registry or Modelbit
 * How to visualize the predicted results from the forecasting model
 * How to convert a Hex project into an interactive web app
 
@@ -39,7 +40,7 @@ Data for this lab was generated using Gretel.ai based on a sample HR dataset sch
 
 We need to first download the sample data for this lab to the local workstation by clicking on the hyperlink below
 
-[employees_merged.csv](</data/employees_merged.csv>) 
+[employees_merged.csv](</data/employees.csv>) 
 
 
 ## Loading the Data into Snowflake
@@ -83,7 +84,7 @@ Now that you've got your project imported, you will find yourself in the [Logic
 
 Before we dive into the code, we'll need to import our Snowflake data connection, which has been automatically created by the partner connect process.
 
-Head over to the Data sources tab represented by a database icon with a lightning bolt. You should see two data connections - [Demo] Hex public data and Snowflake. Import both connections.
+Head over to the Data sources tab represented by a database icon with a lightning bolt. You should see two data connections - [Demo] Hex public data and [Snowflake]. Import both connections.
 
 ![](assets/DC.gif)
 
@@ -168,6 +169,10 @@ For this, we’ll be using the `SMOTE` algorithm from the `imblearn` package.
 
 First, we'll get our features— aka everything except the target column, ATTRITION. We do this in a SQL cell, making use of the SELECT / EXCLUDE syntax in Snowflake! Uncomment + run the SQL cell called "Features".
 
+Next we need to do some feature engineering - we will drop null values, select the relevant columns. We can use Snowpark ML Preprocessing helper functions to do one hot encoding of our categorical variables, transform using standar scalar and get our final feature set. 
+
+Now is a good time to go back to Snowflake to see how we've been pushing down all our operations to our Snowflake warehouse.
+
 Now, we'll upsample. We could do this locally using SMOTE, but we want this entire workflow to run in Snowpark end-to-end, so we're going to create a stored procedure to do our upsampling.
 
 Run the code cell labeled **Upsampling the data**.
@@ -224,7 +229,7 @@ session.sproc.register(
 
 ```python
 # # here we call the sproc to perform the upsampling
-session.call('upsample_data_with_SMOTE', 'TELECOM_CHURN')
+session.call('upsample_data_with_SMOTE', 'ATTRITION_FEATURES')
 ```
 
 Now all that's left is to query the upsampled data from the table using another SQL cell, in this case the Features upsampled cell. If you prefer, you could change your stored procedure to return a Snowpark DataFrame directly rather than writing back a permanent table, but if you are going to be doing continued work on this dataset, writing a permanent table may make more sense.
@@ -237,33 +242,31 @@ In the cell labeled `Snowflake ML model preprocessing` we'll import Snowpark ML 
 
 ```python
 import snowflake.ml.modeling.preprocessing as pp
-from snowflake.ml.modeling.ensemble import RandomForestClassifier
-dataset = features_upsampled
 
-# Get the list of column names from the dataset
-feature_names_input = [c for c in dataset.columns if c != '"Churn"' and c != "INDEX"]
+numeric=['SALARY', 'SENIORITY', 'TENURE_MONTHS', 'MONTHS_AFTER_COLLEGE','BIRTH_YEAR', 'OVERTIME_HOURS', 'DISTANCE']
+categorical= ['MAPPED_ROLE_CLEAN', 'SEX', 'ETHNICITY','DEGREE_CLEAN']
 
-
-# Initialize a StandardScaler object with input and output column names
-scaler = pp.StandardScaler(
-    input_cols=feature_names_input,
-    output_cols=feature_names_input
+# StandardScalar
+numeric_transformer = pp.StandardScaler(
+    input_cols = numeric,
+    output_cols = numeric,
 )
+numeric_transformer.fit(features)
+features = numeric_transformer.transform(features)
 
-# Fit the scaler to the dataset
-scaler.fit(dataset)
 
-# Transform the dataset using the fitted scaler
-scaled_features = scaler.transform(dataset)
+#OneHotEncoding
+categorical_transformer = pp.OneHotEncoder(
+    input_cols = categorical,
+    output_cols = categorical
+)
+categorical_transformer.fit(features)
+features = categorical_transformer.transform(features)
 
-# Define the target variable (label) column name
-label = ['"Churn"']
 
-# Define the output column name for the predicted label
-output_label = ["predicted_churn"]
-
-# Split the scaled_features dataset into training and testing sets with an 80/20 ratio
-training, testing = scaled_features.random_split(weights=[0.8, 0.2], seed=111)
+# Data Clean Up
+features = features.drop(categorical)
+features.show()
 ```
 
 ### Accepting Anaconda terms
@@ -280,18 +283,27 @@ Duration: 5
 Now we can train our model. Run the cell labeled `Model training`.
 
 ```python
-# Initialize a RandomForestClassifier object with input, label, and output column names
+from snowflake.ml.modeling.ensemble import RandomForestClassifier
+import snowflake.snowpark.functions as f
+
+
+input_cols = features.drop('ATTRITION').columns
+label = ['ATTRITION']
+output = ['PREDICTED_ATTRITION']
+
 model = RandomForestClassifier(
-    input_cols=feature_names_input,
-    label_cols=label,
-    output_cols=output_label,
+    input_cols = input_cols,
+    label_cols = label,
+    output_cols = output,
+    random_state = 66,
+    n_jobs= -1
 )
 
-# Train the RandomForestClassifier model using the training set
-model.fit(training)
+# Note: random_split doesn't exactly match one to one with sklearn even with the same seed!
+features_train, features_test = features.random_split(weights=[0.7, 0.3], seed=66)
 
-# Predict the target variable (attrition) for the testing set using the trained model
-results = model.predict(testing)
+model.fit(features_train)
+result = model.predict(features_test)
 ```
 
 ![](assets/train.png)
@@ -302,16 +314,23 @@ In the next section, we will look at how well our model performed as well as whi
 
 Duration: 5
 
-In order to understand how well our model performs at identifying users at risk of churning, we’ll need to evaluate how well it does predicting attrition outcomes. Specifically, we’ll be looking at the recall score, which tells us _of all the customers that will attrition, how many can it identify._
+In order to understand how well our model performs at identifying users at risk of churning, we’ll need to evaluate how well it does predicting attrition outcomes. Specifically, we’ll be looking at the recall score, which tells us _of all the customers that will attrite, how many can it identify._
 
 Run the code cell labeled **Evaluate model** on _accuracy and recall._
 
 ```python
-predictions = results.to_pandas().sort_values("INDEX")[['predicted_churn'.upper()]].astype(int).to_numpy().flatten()
-actual = testing.to_pandas().sort_values("INDEX")[['Churn']].to_numpy().flatten()
+import snowflake.ml.modeling.metrics as m
 
-accuracy = round(accuracy_score(actual, predictions), 3)
-recall = round(recall_score(actual, predictions), 3)
+precision = m.precision_score(
+    df = result,
+    y_true_col_names = 'ATTRITION',
+    y_pred_col_names = 'PREDICTED_ATTRITION'
+)
+recall = m.recall_score(
+    df = result,
+    y_true_col_names = 'ATTRITION',
+    y_pred_col_names = 'PREDICTED_ATTRITION'
+)
 ```
 
 This will calculate an accuracy and recall score for us which we'll display in a [single value cell](https://learn.hex.tech/docs/logic-cell-types/display-cells/single-value-cells#single-value-cell-configuration).
@@ -344,18 +363,23 @@ Now is the moment we've all been waiting for: predicting the attrition outcome f
 Each input parameter has its own variable as its output, and these variables can be referenced in a Python cell. The model expects the inputs it receives to be in a specific order otherwise it will get confused about what the features mean. Keeping this in mind, execute the Python cell labeled **_Create the user vector_**.
 
 ```python
-inputs = [
-	    account_weeks,
-	    1 if renewed_contract else 0, # This value is a bool and we need to convert to numbers
-	    1 if has_data_plan else 0, # This value is a bool and we need to convert to numbers
-	    data_usage,
-	    customer_service_calls,
-	    mins_per_month,
-	    daytime_calls,
-	    monthly_charge,
-	    overage_fee,
-	    roam_mins,
-]
+from sklearn.preprocessing import StandardScaler
+
+user_vector = np.array([
+     distance,
+     1 if bachelors_degree else 0,
+     tenure_months,
+     Overtime_hours,
+     months_after_college,
+     SEX,
+     Role,
+     birth_year
+ ]).reshape(1,-1)
+
+user_dataframe = pd.DataFrame(user_vector, columns=StandardScaler.input_cols)
+user_vector = StandardScaler.transform(user_dataframe)
+user_vector.columns = [column_name.replace('"', "") for column_name in user_vector.columns]
+user_vector = session.create_dataframe(user_vector)
 ```
 
 This creates a list where each element represents a feature that our model can understand. However, before our model can accept these features, we need to transform our array. To do this, we will convert our list into a numpy array and reshape it so that there is only one row and one column for all features.
@@ -373,19 +397,23 @@ user_vector_scaled = scaler.transform(user_vector)
 The final cell should look like this:
 
 ```python
-# get model inputs
+from sklearn.preprocessing import StandardScaler
+
 user_vector = np.array([
-    account_weeks,
-    1 if renewed_contract else 0,
-    1 if has_data_plan else 0,
-    data_usage,
-    customer_service_calls,
-    mins_per_month,
-    daytime_calls,
-    monthly_charge,
-    overage_fee,
-    roam_mins,
-]).reshape(1,-1)
+     distance,
+     1 if bachelors_degree else 0,
+     tenure_months,
+     Overtime_hours,
+     months_after_college,
+     SEX,
+     Role,
+     birth_year
+ ]).reshape(1,-1)
+
+user_dataframe = pd.DataFrame(user_vector, columns=StandardScaler.input_cols)
+user_vector = StandardScaler.transform(user_dataframe)
+user_vector.columns = [column_name.replace('"', "") for column_name in user_vector.columns]
+user_vector = session.create_dataframe(user_vector)
 
 user_dataframe = pd.DataFrame(user_vector, columns=scaler.input_cols)
 user_vector = scaler.transform(user_dataframe)
